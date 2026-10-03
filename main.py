@@ -166,6 +166,21 @@ FEATURE_ITEMS = [
 ]
 
 
+def fallback_answer(question: str, subject: str, level: str, reason: Any) -> str:
+    """Offline reply so the chat box always responds, even when AI is unavailable."""
+    return (
+        "**Local reply** (the AI service is not reachable right now)\n\n"
+        f"I received your question: **{question}**\n\n"
+        f"- Subject: {subject}\n"
+        f"- Level: {level}\n\n"
+        "**How to move forward:**\n\n"
+        "1. Split the question into the smallest part you are unsure about.\n"
+        "2. Write a tiny example and run it, or dry-run the steps on paper.\n"
+        "3. Read the exact error message and note the line it points to.\n\n"
+        f"_AI skipped because: {reason}_"
+    )
+
+
 class ChatRequest(BaseModel):
     question: str | None = Field(default=None, max_length=10000)
     message: str | None = Field(default=None, max_length=10000)
@@ -209,6 +224,14 @@ def require_user(credentials: HTTPAuthorizationCredentials | None = Depends(auth
     except ValueError as exc:
         status_code = 403 if str(exc).startswith("Please verify") else 401
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+
+def optional_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(auth_scheme),
+) -> Dict[str, Any] | None:
+    if credentials is None:
+        return None
+    return require_user(credentials)
 
 
 def run_ai(operation):
@@ -330,13 +353,19 @@ def get_features() -> Dict[str, Any]:
 
 @app.post("/qa")
 @app.post("/api/chat")
-def chat(req: ChatRequest, user: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+def chat(req: ChatRequest, user: Dict[str, Any] | None = Depends(optional_user)) -> Dict[str, Any]:
     question = (req.question or req.message or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Enter a question first.")
-    answer = run_ai(lambda: answer_question(question, req.subject, req.level, req.age_group))
-    history_saved = save_chat_history(
-        user_id=str(user["uid"]), question=question, answer=answer, feature="qa"
+    try:
+        answer = run_ai(lambda: answer_question(question, req.subject, req.level, req.age_group))
+    except HTTPException as exc:
+        logger.warning("Gemini was unavailable for /qa; using the offline fallback reply.", exc_info=True)
+        answer = fallback_answer(question, req.subject, req.level, exc.detail)
+    history_saved = (
+        save_chat_history(user_id=str(user["uid"]), question=question, answer=answer, feature="qa")
+        if user
+        else False
     )
     return {
         "success": True,
@@ -345,18 +374,22 @@ def chat(req: ChatRequest, user: Dict[str, Any] = Depends(require_user)) -> Dict
         "subject": req.subject,
         "level": req.level,
         "history_saved": history_saved,
-        "history_warning": None if history_saved else "Your answer is ready, but chat history could not be saved right now.",
+        "history_warning": (
+            None
+            if history_saved or user is None
+            else "Your answer is ready, but chat history could not be saved right now."
+        ),
     }
 
 
 @app.post("/explain")
-def explain(req: ExplainRequest, _: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+def explain(req: ExplainRequest, _: Dict[str, Any] | None = Depends(optional_user)) -> Dict[str, Any]:
     return {"success": True, "explanation": run_ai(lambda: explain_topic(req.topic.strip()))}
 
 
 @app.post("/quiz")
 @app.post("/api/quiz")
-def quiz(req: QuizRequest, _: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+def quiz(req: QuizRequest, _: Dict[str, Any] | None = Depends(optional_user)) -> Dict[str, Any]:
     source = (req.text or req.topic or "").strip()
     if not source:
         raise HTTPException(status_code=400, detail="Enter a topic or passage for the quiz.")
@@ -366,7 +399,7 @@ def quiz(req: QuizRequest, _: Dict[str, Any] = Depends(require_user)) -> Dict[st
 
 @app.post("/summarize")
 @app.post("/api/summarize")
-def summarize(req: SummaryRequest, _: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+def summarize(req: SummaryRequest, _: Dict[str, Any] | None = Depends(optional_user)) -> Dict[str, Any]:
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Paste some text to summarize.")
     return {"success": True, "summary": run_ai(lambda: summarize_text(req.text.strip()))}
@@ -374,7 +407,7 @@ def summarize(req: SummaryRequest, _: Dict[str, Any] = Depends(require_user)) ->
 
 @app.post("/learn/recommendations")
 @app.post("/api/learning-plan")
-def learning_plan(req: LearningPlanRequest, _: Dict[str, Any] = Depends(require_user)) -> Dict[str, Any]:
+def learning_plan(req: LearningPlanRequest, _: Dict[str, Any] | None = Depends(optional_user)) -> Dict[str, Any]:
     topic = (req.topic or req.subject).strip()
     if not topic:
         raise HTTPException(status_code=400, detail="Enter a learning topic.")
